@@ -7,6 +7,7 @@ A collection of useful shell scripts for various development and maintenance tas
 ### Database Management
 
 - [Database Backup Utility](db_dump.md) - Interactive database backup tool with support for PostgreSQL and MySQL
+- [Database Restore Utility](db_restore.md) - Interactive database restore tool with support for PostgreSQL and MySQL
 
 ### Development
 

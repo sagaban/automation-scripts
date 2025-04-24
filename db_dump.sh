@@ -153,7 +153,17 @@ mkdir -p "$BACKUP_DIR"
 
 # Generate timestamp with date and time
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
-BACKUP_FILE="${BACKUP_DIR}/${DATABASE}_${TIMESTAMP}.backup"
+BACKUP_FILE="${BACKUP_DIR}/local-${DATABASE}_${TIMESTAMP}.backup"
+
+# Function to list PostgreSQL schemas
+list_postgres_schemas() {
+    if ! command -v psql &> /dev/null; then
+        echo "Error: psql is not installed"
+        exit 1
+    fi
+
+    PGPASSWORD=$DB_PASSWORD psql -h "$HOST" -p "$PORT" -U "$USERNAME" -d "$DATABASE" -t -c "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT IN ('pg_catalog', 'information_schema');"
+}
 
 # Function to create PostgreSQL dump
 dump_postgres() {
@@ -162,10 +172,17 @@ dump_postgres() {
         exit 1
     fi
     
-    #  /opt/homebrew/Cellar/postgresql@16/16.8_1/bin/pg_dump --verbose --host=localhost --port=15432 ****** --format=c --encoding=UTF-8 --clean --create --file /private/tmp/local-monorepo-concntric_db-202504161113.backup -n concntric_1699961672 -n public -n pumpernic_1716455915 concntric_db
-   
+    # Get all schemas
+    SCHEMAS=$(list_postgres_schemas)
+    SCHEMA_ARGS=""
+    for schema in $SCHEMAS; do
+        SCHEMA_ARGS="$SCHEMA_ARGS -n $schema"
+    done
+
+    ## pg_dump --verbose --host=localhost --port=15432 ****** --format=c --encoding=UTF-8 --clean --create --file /Users/santiago/concntric/documents/dumps/local-monorepo-concntric_db-202504241818.backup -n concntric_1699961672 -n public -n pumpernic_1716455915 concntric_db
+    
     echo "Creating PostgreSQL dump..."
-    if PGPASSWORD=$DB_PASSWORD pg_dump --verbose -h "$HOST" -p "$PORT" -U "$USERNAME" -F c --encoding=UTF-8 --clean --create --file "$BACKUP_FILE" "$DATABASE"; then
+    if PGPASSWORD=$DB_PASSWORD pg_dump --verbose --host="$HOST" --port="$PORT" -U "$USERNAME" --format=c --encoding=UTF-8 --clean --create --file "$BACKUP_FILE" $SCHEMA_ARGS "$DATABASE"; then
         echo "Successfully created PostgreSQL dump at $BACKUP_FILE"
     else
         echo "Error creating PostgreSQL dump"

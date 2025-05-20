@@ -1,6 +1,6 @@
 #!/bin/zsh
 
-function run-backend() {
+function run-docker() {
     # Define arrays for labels and values
     local labels=(
         "Main Database"
@@ -29,7 +29,7 @@ function run-backend() {
         local selected_db=${values[$selected_index]}
         echo "Selected: ${labels[$selected_index]} ($selected_db)"
         zellij action rename-pane "${labels[$selected_index]} (concntric_db$selected_db)"
-        CUSTOM_ENV=$selected_db WORKING_DIR=$(pwd) COMPOSE_PROFILES=backend GIT_HASH=$(git rev-parse --short HEAD) GIT_LONG_HASH=$(git rev-parse HEAD) docker compose up --build
+        CUSTOM_ENV=$selected_db WORKING_DIR=$(pwd) COMPOSE_PROFILES=backend GIT_HASH=$(git rev-parse --short HEAD) GIT_LONG_HASH=$(git rev-parse HEAD) docker compose up database mailhog localstack auth --build 
     else
         echo "No database selected"
     fi

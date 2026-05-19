@@ -1,6 +1,6 @@
 #!/bin/zsh
 
-function run-docker() {
+function select_db() {
     # Define arrays for labels and values
     local labels=(
         "Main Database"
@@ -25,18 +25,18 @@ function run-docker() {
     local selected_index=$(printf '%s\n' "${labels[@]}" | nl | fzf --height 33% --reverse --border | awk '{print $1}')
     
     if [ -n "$selected_index" ]; then
-        # Get the corresponding value from the values array
-        local selected_db=${values[$selected_index]}
+
         echo "Selected: ${labels[$selected_index]} ($selected_db)"
-        zellij action rename-pane "${labels[$selected_index]} (concntric_db$selected_db)"
-        CUSTOM_ENV=$selected_db WORKING_DIR=$(pwd) COMPOSE_PROFILES=backend GIT_HASH=$(git rev-parse --short HEAD) GIT_LONG_HASH=$(git rev-parse HEAD) docker compose up database mailhog localstack auth --build
-        # docker compose down
-        # echo "CUSTOM_ENV=$selected_db docker compose up database mailhog localstack auth"
-        # CUSTOM_ENV=$selected_db docker compose up database mailhog localstack auth 
+        
+        # set CUSTOM_ENV in the system
+        # set DB_NAME 
+        # Stop all docker containers
+        # stop django
+        # Restart them maybe?
     else
         echo "No database selected"
     fi
 }
 
 # Execute the function
-run-docker 
+select_db 

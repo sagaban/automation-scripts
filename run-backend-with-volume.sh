@@ -3,7 +3,7 @@ set -euo pipefail
 
 APP_ROOT="/Users/santiago/repos/app"
 DB_DIR="$APP_ROOT/db"
-STORAGE_DIR="$APP_ROOT/storage"
+INFRASTRUCTURE_DIR="$APP_ROOT/infrastructure"
 
 # Globals used to pass arrays/results between functions (bash 3.2 compatible)
 SUFFIXES=()
@@ -33,7 +33,7 @@ pick_option() {
 
   PICK_RESULT=""
   if command -v fzf &>/dev/null; then
-    PICK_RESULT=$(printf '%s\n' "${OPTIONS[@]}" | fzf --height=~50% --reverse --header="$prompt") || true
+    PICK_RESULT=$(printf '%s\n' "${OPTIONS[@]}" | fzf --height=~50% --reverse --cycle --header="$prompt") || true
     if [[ -z "$PICK_RESULT" ]]; then
       exit 1
     fi
@@ -83,12 +83,51 @@ run_backend() {
     cmux rename-tab --tab "$CMUX_SURFACE_ID" --title "$suffix"
   fi
   cd "$APP_ROOT"
+  echo "Stopping any running task..."
+  task stop || true
   task run-backend-build DB_SUFIX="$suffix"
 }
 
 # Sanitize a branch name into a folder-friendly suffix
 sanitize_suffix() {
   printf '%s' "$1" | tr '/' '-' | tr -cd '[:alnum:]._-'
+}
+
+# Returns the current branch of $APP_ROOT (sanitized) on stdout, or empty
+current_branch_suffix() {
+  local b=""
+  b=$(git -C "$APP_ROOT" branch --show-current 2>/dev/null || true)
+  [[ -z "$b" ]] && b=$(git branch --show-current 2>/dev/null || true)
+  sanitize_suffix "$b"
+}
+
+# Reads SUFFIXES, writes OPTIONS with current-branch-match first (when present),
+# then "local" (when present), then the rest in original order.
+build_options_branch_first() {
+  OPTIONS=()
+  local branch_suffix
+  branch_suffix=$(current_branch_suffix)
+
+  local has_branch=0
+  local has_local=0
+  local s
+  for s in "${SUFFIXES[@]}"; do
+    [[ -n "$branch_suffix" && "$s" == "$branch_suffix" ]] && has_branch=1
+    [[ "$s" == "local" ]] && has_local=1
+  done
+
+  if [[ "$has_branch" -eq 1 ]]; then
+    OPTIONS+=("$branch_suffix")
+  fi
+  if [[ "$has_local" -eq 1 && "$branch_suffix" != "local" ]]; then
+    OPTIONS+=("local")
+  fi
+  for s in "${SUFFIXES[@]}"; do
+    if [[ "$s" != "local" ]] && [[ -z "$branch_suffix" || "$s" != "$branch_suffix" ]]; then
+      OPTIONS+=("$s")
+    fi
+  done
+  return 0
 }
 
 create_new_volume() {
@@ -103,10 +142,8 @@ create_new_volume() {
   local source="$PICK_RESULT"
 
   # Default suffix from current branch (app repo, then cwd)
-  local default_suffix=""
-  default_suffix=$(git -C "$APP_ROOT" branch --show-current 2>/dev/null || true)
-  [[ -z "$default_suffix" ]] && default_suffix=$(git branch --show-current 2>/dev/null || true)
-  default_suffix=$(sanitize_suffix "$default_suffix")
+  local default_suffix
+  default_suffix=$(current_branch_suffix)
 
   local prompt="New suffix"
   [[ -n "$default_suffix" ]] && prompt+=" [default: $default_suffix]"
@@ -132,26 +169,26 @@ create_new_volume() {
 
   local db_src="$DB_DIR/data-$source"
   local db_dst="$DB_DIR/data-$new_suffix"
-  local storage_src="$STORAGE_DIR/data-$source"
-  local storage_dst="$STORAGE_DIR/data-$new_suffix"
+  local infrastructure_src="$INFRASTRUCTURE_DIR/data-$source"
+  local infrastructure_dst="$INFRASTRUCTURE_DIR/data-$new_suffix"
 
   if [[ -e "$db_dst" ]]; then
     echo "Target $db_dst already exists. Aborting."
     exit 1
   fi
-  if [[ -e "$storage_dst" ]]; then
-    echo "Target $storage_dst already exists. Aborting."
+  if [[ -e "$infrastructure_dst" ]]; then
+    echo "Target $infrastructure_dst already exists. Aborting."
     exit 1
   fi
 
   echo "Copying $db_src -> $db_dst"
   cp -a "$db_src" "$db_dst"
 
-  if [[ -d "$storage_src" ]]; then
-    echo "Copying $storage_src -> $storage_dst"
-    cp -a "$storage_src" "$storage_dst"
+  if [[ -d "$infrastructure_src" ]]; then
+    echo "Copying $infrastructure_src -> $infrastructure_dst"
+    cp -a "$infrastructure_src" "$infrastructure_dst"
   else
-    echo "Note: $storage_src does not exist; skipping storage copy."
+    echo "Note: $infrastructure_src does not exist; skipping infrastructure copy."
   fi
 
   run_backend "$new_suffix"
@@ -169,7 +206,7 @@ delete_volume() {
   local target="$PICK_RESULT"
 
   local db_target="$DB_DIR/data-$target"
-  local storage_target="$STORAGE_DIR/data-$target"
+  local infrastructure_target="$INFRASTRUCTURE_DIR/data-$target"
 
   if ! command -v trash &>/dev/null; then
     echo "'trash' command not found. Install with: brew install trash" >&2
@@ -179,7 +216,7 @@ delete_volume() {
   echo
   echo "About to move to Trash:"
   [[ -d "$db_target" ]] && echo "  - $db_target"
-  [[ -d "$storage_target" ]] && echo "  - $storage_target"
+  [[ -d "$infrastructure_target" ]] && echo "  - $infrastructure_target"
   echo
   local confirm=""
   read -rp "Proceed? [y/N]: " confirm
@@ -192,9 +229,9 @@ delete_volume() {
     echo "Trashing $db_target..."
     trash "$db_target"
   fi
-  if [[ -d "$storage_target" ]]; then
-    echo "Trashing $storage_target..."
-    trash "$storage_target"
+  if [[ -d "$infrastructure_target" ]]; then
+    echo "Trashing $infrastructure_target..."
+    trash "$infrastructure_target"
   fi
   echo "Done."
 }
@@ -210,7 +247,7 @@ use_existing_volume() {
   if [[ ${#SUFFIXES[@]} -eq 1 ]]; then
     selected="${SUFFIXES[0]}"
   else
-    build_options_local_first
+    build_options_branch_first
     pick_option "Pick existing volume"
     selected="$PICK_RESULT"
   fi

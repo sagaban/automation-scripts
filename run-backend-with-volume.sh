@@ -76,15 +76,33 @@ build_options_local_first() {
   return 0
 }
 
+# Rename the surrounding terminal tab, when running inside one we know how to
+# drive. Purely cosmetic: every call is silenced and forced to succeed so a
+# missing CLI or stale id can never abort the run.
+# Args: <title>
+rename_tab() {
+  local title="$1"
+
+  # herdr: `herdr tab rename <tab-id> <label>`, echoes a JSON result.
+  if [[ -n "${HERDR_TAB_ID:-}" ]] && command -v herdr &>/dev/null; then
+    herdr tab rename "$HERDR_TAB_ID" "$title" >/dev/null 2>&1 || true
+  fi
+
+  # cmux: CMUX_WORKSPACE_ID is unset for the call because a stale value makes
+  # cmux fail with "not_found: Workspace not found" before it resolves the tab.
+  if [[ -n "${CMUX_SURFACE_ID:-}" ]] && command -v cmux &>/dev/null; then
+    env -u CMUX_WORKSPACE_ID cmux rename-tab --tab "$CMUX_SURFACE_ID" --title "$title" >/dev/null 2>&1 || true
+  fi
+}
+
 run_backend() {
   local suffix="$1"
   echo "Selected: $suffix"
-  if [[ -n "${CMUX_SURFACE_ID:-}" ]] && command -v cmux &>/dev/null; then
-    cmux rename-tab --tab "$CMUX_SURFACE_ID" --title "$suffix"
-  fi
+  rename_tab "$suffix"
   cd "$APP_ROOT"
-  echo "Stopping any running task..."
+  echo "Stopping any running task (clearing orphaned anonymous volumes, keeping named ones like mailpit_data)..."
   task stop || true
+  docker volume prune -f || true
   task run-backend-build DB_SUFIX="$suffix"
 }
 

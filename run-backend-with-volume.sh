@@ -98,12 +98,18 @@ rename_tab() {
 run_backend() {
   local suffix="$1"
   echo "Selected: $suffix"
+
+  OPTIONS=("Build the docker image" "Skip build (run existing image)")
+  pick_option "Build the docker image?"
+  local run_task="run-backend-build"
+  [[ "$PICK_RESULT" == "Skip build (run existing image)" ]] && run_task="run-backend"
+
   rename_tab "$suffix"
   cd "$APP_ROOT"
   echo "Stopping any running task (clearing orphaned anonymous volumes, keeping named ones like mailpit_data)..."
   task stop || true
   docker volume prune -f || true
-  task run-backend-build DB_SUFIX="$suffix"
+  task "$run_task" DB_SUFIX="$suffix"
 }
 
 # Sanitize a branch name into a folder-friendly suffix

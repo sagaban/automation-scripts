@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="/Users/santiago/repos/app"
 DB_DIR="$APP_ROOT/db"
 INFRASTRUCTURE_DIR="$APP_ROOT/infrastructure"
@@ -99,10 +100,15 @@ run_backend() {
   local suffix="$1"
   echo "Selected: $suffix"
 
-  OPTIONS=("Build the docker image" "Skip build (run existing image)")
+  OPTIONS=("Skip build (run existing image)" "Build the docker image")
   pick_option "Build the docker image?"
-  local run_task="run-backend-build"
-  [[ "$PICK_RESULT" == "Skip build (run existing image)" ]] && run_task="run-backend"
+  local run_task="run-backend"
+  [[ "$PICK_RESULT" == "Build the docker image" ]] && run_task="run-backend-build"
+
+  # Unconditional: a build pulls its base images from ECR, and the compose
+  # stack wants CODEARTIFACT_AUTH_TOKEN either way. Refresh before anything is
+  # torn down, so a failed login doesn't leave the stack stopped.
+  "$SCRIPT_DIR/ensure-aws-session.sh"
 
   rename_tab "$suffix"
   cd "$APP_ROOT"

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Interactive launcher for `task stack`. Asks for every parameter (stack
-# number, seed source, reseed, build) with sensible defaults, then runs:
-#   RESEED=<0|1> BUILD=<0|1> SEED_FROM=<suffix|path> task stack -- <N>
+# number, seed source, reseed, build, amplify) with sensible defaults, then runs:
+#   RESEED=<0|1> BUILD=<0|1> AMPLIFY=<0|1> SEED_FROM=<suffix|path> task stack -- <N>
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -166,15 +166,24 @@ OPTIONS=("0 - use existing images" "1 - rebuild images")
 pick_option "BUILD? (default: 0)"
 BUILD="${PICK_RESULT:0:1}"
 
+# --- AMPLIFY ----------------------------------------------------------------
+# Off by default, same as `task stack` itself: it keeps boots fast and avoids
+# building the amplify image unless asked for.
+OPTIONS=("0 - no Amplify" "1 - also run this stack's monorepo Amplify service")
+pick_option "AMPLIFY? (default: 0)"
+AMPLIFY="${PICK_RESULT:0:1}"
+
 # --- confirm & run ----------------------------------------------------------
-# RESEED and BUILD are NON-EMPTY tests downstream, not == 1: stack-seed.sh does
-# `[ -n "$RESEED" ]` and the Taskfile does `[ -n "{{.BUILD}}" ]`. Passing the
-# literal "0" is therefore truthy — it reseeds the DB and forces
-# --build --renew-anon-volumes. A 0 answer must pass nothing at all, so only
-# the vars actually turned on get into the command.
+# RESEED, BUILD and AMPLIFY are NON-EMPTY tests downstream, not == 1:
+# stack-seed.sh does `[ -n "$RESEED" ]` and the Taskfile does
+# `[ -n "{{.BUILD}}" ]` / `[ -n "{{.AMPLIFY}}" ]`. Passing the literal "0" is
+# therefore truthy — it would reseed the DB, force a rebuild and add the
+# amplify profile. A 0 answer must pass nothing at all, so only the vars
+# actually turned on get into the command.
 ENV_ARGS=()
 [[ "$RESEED" == "1" ]] && ENV_ARGS+=("RESEED=1")
 [[ "$BUILD" == "1" ]] && ENV_ARGS+=("BUILD=1")
+[[ "$AMPLIFY" == "1" ]] && ENV_ARGS+=("AMPLIFY=1")
 [[ -n "$SEED_FROM" ]] && ENV_ARGS+=("SEED_FROM=$SEED_FROM")
 
 echo
@@ -210,6 +219,7 @@ rename_tab "stack-$N"
 # checkout. Forced to succeed: nothing running is the normal case.
 echo "Stopping stack $N if it is running..."
 task stack-down -- "$N" || true
+"$SCRIPT_DIR/prune-orphan-volumes.sh"
 
 # The guard matters under `set -u` on bash 3.2, where expanding an empty array
 # is an error — and `env ""` would try to run the empty string as a command.

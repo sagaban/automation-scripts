@@ -112,9 +112,9 @@ run_backend() {
 
   rename_tab "$suffix"
   cd "$APP_ROOT"
-  echo "Stopping any running task (clearing orphaned anonymous volumes, keeping named ones like mailpit_data)..."
+  echo "Stopping any running task..."
   task stop || true
-  docker volume prune -f || true
+  "$SCRIPT_DIR/prune-orphan-volumes.sh"
   task "$run_task" DB_SUFIX="$suffix"
 }
 

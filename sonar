@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# Query SonarCloud for the concntric app (replaces the mcp/sonarqube MCP server).
+#
+# Usage:
+#   sonar issues   [PR] [--be|--fe]   open issues on a PR (default: current branch's PR)
+#   sonar gate     [PR] [--be|--fe]   quality gate status + failing conditions
+#   sonar coverage [PR] [--be|--fe]   new-code coverage / duplication
+#   sonar hotspots [PR] [--be|--fe]   security hotspots to review
+#   sonar rule <key>                  explain a rule, e.g. typescript:S3358
+#   sonar api <path?query>            raw GET, e.g. sonar api 'api/issues/search?...'
+#
+# PR: number, or omitted → `gh pr view` on the current branch; `main` → main branch analysis.
+# Projects: both by default; --be / --fe to narrow.
+# Token: $SONAR_TOKEN, else the SONAR_TOKEN= line in the repo's .env (as .husky/sonar-check).
+
+set -euo pipefail
+
+HOST="https://sonarcloud.io"
+BE="concntric_backend_app"
+FE="concntric_frontend_app"
+
+die() { echo "sonar: $*" >&2; exit 1; }
+
+load_token() {
+  [ -n "${SONAR_TOKEN:-}" ] && return
+  local root env_file
+  root="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+  for env_file in "$root/.env" "$HOME/repos/app/.env"; do
+    if [ -f "$env_file" ]; then
+      SONAR_TOKEN="$(sed -n 's/^SONAR_TOKEN=//p' "$env_file" | tr -d '"'"'"' \r' | head -1)"
+      [ -n "$SONAR_TOKEN" ] && return
+    fi
+  done
+  die "no SONAR_TOKEN in env or .env (private projects return 0 results without it)"
+}
+
+get() {
+  local out code
+  out="$(curl -sS -w '\n%{http_code}' -H "Authorization: Bearer $SONAR_TOKEN" "$HOST/$1")"
+  code="${out##*$'\n'}"
+  out="${out%$'\n'*}"
+  if [ "$code" = 404 ] && [ -n "${SOFT_404:-}" ]; then return 1; fi
+  [ "$code" = 200 ] || die "HTTP $code for $1: $(echo "$out" | jq -r '.errors[0].msg? // .' 2>/dev/null)"
+  echo "$out"
+}
+
+skip() { echo "$1 @ $LABEL: no analysis (PR didn't touch this project?)"; }
+
+# Parse "[PR] [--be|--fe]" into $SCOPE (query fragment), $LABEL and $PROJECTS.
+parse_target() {
+  local pr="" projects="$BE $FE"
+  for arg in "$@"; do
+    case "$arg" in
+      --be) projects="$BE" ;;
+      --fe) projects="$FE" ;;
+      *) pr="$arg" ;;
+    esac
+  done
+  if [ -z "$pr" ]; then
+    pr="$(gh pr view --json number -q .number 2>/dev/null || true)"
+    [ -n "$pr" ] || die "no PR for the current branch; pass a PR number or 'main'"
+  fi
+  if [ "$pr" = main ]; then SCOPE=""; LABEL="main"; else SCOPE="&pullRequest=$pr"; LABEL="PR #$pr"; fi
+  PROJECTS="$projects"
+}
+
+cmd_issues() {
+  parse_target "$@"
+  local keys; keys="$(echo "$PROJECTS" | tr ' ' ',')"
+  local json; json="$(get "api/issues/search?componentKeys=$keys$SCOPE&issueStatuses=OPEN,CONFIRMED&ps=500&s=FILE_LINE")"
+  echo "$json" | jq -r --arg label "$LABEL" '
+    "\(.total) open issue(s) on \($label)",
+    (.issues[] | "  \(.component | sub("^[^:]*:"; "")):\(.line // "-")  [\(.impacts[0].severity // .severity)] \(.message)  (\(.rule))")'
+}
+
+cmd_gate() {
+  parse_target "$@"
+  for p in $PROJECTS; do
+    json="$(SOFT_404=1 get "api/qualitygates/project_status?projectKey=$p$SCOPE")" || { skip "$p"; continue; }
+    echo "$json" | jq -r --arg p "$p" --arg label "$LABEL" '
+      "\($p) @ \($label): \(.projectStatus.status)",
+      (.projectStatus.conditions[] | select(.status != "OK")
+        | "  ✗ \(.metricKey): \(.actualValue // "-") (\(.comparator) \(.errorThreshold))")'
+  done
+}
+
+cmd_coverage() {
+  parse_target "$@"
+  local metrics="new_coverage,new_lines_to_cover,new_uncovered_lines,new_duplicated_lines_density"
+  [ -z "$SCOPE" ] && metrics="coverage,lines_to_cover,uncovered_lines,duplicated_lines_density"
+  for p in $PROJECTS; do
+    json="$(SOFT_404=1 get "api/measures/component?component=$p$SCOPE&metricKeys=$metrics")" || { skip "$p"; continue; }
+    echo "$json" | jq -r --arg p "$p" --arg label "$LABEL" '
+      "\($p) @ \($label):",
+      (.component.measures[] | "  \(.metric): \(.periods[0].value // .period.value // .value // "-")")'
+  done
+}
+
+cmd_hotspots() {
+  parse_target "$@"
+  for p in $PROJECTS; do
+    json="$(SOFT_404=1 get "api/hotspots/search?projectKey=$p$SCOPE&status=TO_REVIEW&ps=500")" || { skip "$p"; continue; }
+    echo "$json" | jq -r --arg p "$p" --arg label "$LABEL" '
+      "\($p) @ \($label): \(.paging.total) hotspot(s) to review",
+      (.hotspots[] | "  \(.component | sub("^[^:]*:"; "")):\(.line // "-")  [\(.vulnerabilityProbability)] \(.message)  (\(.ruleKey))")'
+  done
+}
+
+cmd_rule() {
+  [ -n "${1:-}" ] || die "usage: sonar rule <key>"
+  get "api/rules/show?key=$1&organization=concntric" | jq -r '
+    .rule | "\(.key) — \(.name)  [\(.impacts[0].severity // .severity)]\n",
+    ((.descriptionSections // []
+      | sort_by({root_cause: 0, introduction: 1, how_to_fix: 2, resources: 3}[.key] // 9)
+      | map(.content) | join("\n")) // .htmlDesc
+      | gsub("<[^>]+>"; "") | gsub("&lt;"; "<") | gsub("&gt;"; ">") | gsub("&amp;"; "&") | gsub("&quot;"; "\""))'
+}
+
+main() {
+  local cmd="${1:-}"; shift || true
+  case "$cmd" in
+    issues|gate|coverage|hotspots|rule) load_token; "cmd_$cmd" "$@" ;;
+    api) load_token; [ -n "${1:-}" ] || die "usage: sonar api <path?query>"; get "${1#/}" | jq . ;;
+    *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; [ -z "$cmd" ] || exit 1 ;;
+  esac
+}
+
+main "$@"

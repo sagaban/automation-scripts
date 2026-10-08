@@ -1,8 +1,44 @@
 #!/usr/bin/env bash
-# Interactive launcher for `task stack`. Asks for every parameter (stack
-# number, seed source, reseed, build, amplify) with sensible defaults, then runs:
+# Launcher for `task stack`. Asks for every parameter (stack number, seed
+# source, reseed, build, amplify) with sensible defaults, then runs:
 #   RESEED=<0|1> BUILD=<0|1> AMPLIFY=<0|1> SEED_FROM=<suffix|path> task stack -- <N>
+#
+# Any parameter can be passed as a flag instead, and is then not asked for.
+# With -y every parameter not given takes its default without asking (also the
+# RESEED confirmation), so it can run unattended, e.g. from batuta:
+#   run-stack.sh -n 4 -y
+#   run-stack.sh --stack 4 --reseed --seed-from data-qa --build --amplify -y
 set -euo pipefail
+
+usage() {
+  cat <<USAGE
+usage: run-stack.sh [-n|--stack N] [--reseed|--no-reseed] [--seed-from <suffix|path>]
+                    [--build|--no-build] [--amplify|--no-amplify] [-y|--yes]
+USAGE
+}
+
+# Flag values; empty means "ask" (or "default" under -y).
+ARG_N=""
+ARG_RESEED=""
+ARG_SEED_FROM=""
+ARG_BUILD=""
+ARG_AMPLIFY=""
+ASSUME_YES=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -n | --stack) ARG_N="${2:-}"; shift 2 ;;
+    --reseed) ARG_RESEED=1; shift ;;
+    --no-reseed) ARG_RESEED=0; shift ;;
+    --seed-from) ARG_SEED_FROM="${2:-}"; shift 2 ;;
+    --build) ARG_BUILD=1; shift ;;
+    --no-build) ARG_BUILD=0; shift ;;
+    --amplify) ARG_AMPLIFY=1; shift ;;
+    --no-amplify) ARG_AMPLIFY=0; shift ;;
+    -y | --yes) ASSUME_YES=1; shift ;;
+    -h | --help) usage; exit 0 ;;
+    *) echo "Unknown argument: $1" >&2; usage >&2; exit 1 ;;
+  esac
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 APP_ROOT="/Users/santiago/repos/app"
@@ -114,20 +150,38 @@ echo "Repo: $REPO_ROOT"
 echo
 
 # --- N (stack number) -------------------------------------------------------
-N=""
-while true; do
-  read -rp "Stack number N [default: 1]: " N
-  [[ -z "$N" ]] && N="1"
-  if [[ "$N" =~ ^[0-9]+$ ]]; then
-    break
+N="$ARG_N"
+if [[ -n "$N" ]]; then
+  if [[ ! "$N" =~ ^[0-9]+$ ]]; then
+    echo "N must be a non-negative integer (0 reuses the base ports)." >&2
+    exit 1
   fi
-  echo "N must be a non-negative integer (0 reuses the base ports)."
-done
+elif [[ "$ASSUME_YES" == "1" ]]; then
+  # No default under -y: `task stack-down` below stops whatever runs on stack N,
+  # from ANY checkout, so guessing a number could kill someone else's stack.
+  echo "-y needs an explicit stack number (-n N)." >&2
+  exit 1
+else
+  while true; do
+    read -rp "Stack number N [default: 1]: " N
+    [[ -z "$N" ]] && N="1"
+    if [[ "$N" =~ ^[0-9]+$ ]]; then
+      break
+    fi
+    echo "N must be a non-negative integer (0 reuses the base ports)."
+  done
+fi
 
 # --- RESEED -----------------------------------------------------------------
-OPTIONS=("0 - keep the stack DB if it already exists" "1 - discard the stack DB and re-clone from the seed")
-pick_option "RESEED? (default: 0)"
-RESEED="${PICK_RESULT:0:1}"
+if [[ -n "$ARG_RESEED" ]]; then
+  RESEED="$ARG_RESEED"
+elif [[ "$ASSUME_YES" == "1" ]]; then
+  RESEED="0"
+else
+  OPTIONS=("0 - keep the stack DB if it already exists" "1 - discard the stack DB and re-clone from the seed")
+  pick_option "RESEED? (default: 0)"
+  RESEED="${PICK_RESULT:0:1}"
+fi
 
 # --- SEED_FROM --------------------------------------------------------------
 # Only worth asking when something will actually be seeded: RESEED=1 discards
@@ -140,9 +194,15 @@ if [[ "$RESEED" == "1" ]] || [[ -z $(ls -A "$STACK_DB_DIR" 2>/dev/null) ]]; then
   if [[ "$RESEED" != "1" ]]; then
     echo "No existing data in $STACK_DB_DIR — this stack needs a seed."
   fi
-  build_seed_options
-  pick_option "Seed from which data set in $SEED_DB_DIR? (default: data-local)"
-  SEED_FROM="$PICK_RESULT"
+  if [[ -n "$ARG_SEED_FROM" ]]; then
+    SEED_FROM="$ARG_SEED_FROM"
+  elif [[ "$ASSUME_YES" == "1" ]]; then
+    SEED_FROM="data-local"
+  else
+    build_seed_options
+    pick_option "Seed from which data set in $SEED_DB_DIR? (default: data-local)"
+    SEED_FROM="$PICK_RESULT"
+  fi
   if [[ "$SEED_FROM" == "Other (type a suffix or path)" ]]; then
     while true; do
       read -rp "SEED_FROM (suffix like stack-3, or path to a db/data-<X> dir): " SEED_FROM
@@ -152,26 +212,38 @@ if [[ "$RESEED" == "1" ]] || [[ -z $(ls -A "$STACK_DB_DIR" 2>/dev/null) ]]; then
       [[ -n "$SEED_FROM" ]] && break
       echo "SEED_FROM cannot be empty."
     done
-  else
+  elif [[ "$SEED_FROM" != */* ]]; then
     # Pass the absolute path, not the bare suffix: a bare suffix resolves
     # against the current checkout first, so running in a worktree that happens
     # to have a same-named data dir would seed from there instead of from
-    # $SEED_DB_DIR.
+    # $SEED_DB_DIR. (A path given with --seed-from is passed through as is.)
     SEED_FROM="$SEED_DB_DIR/$SEED_FROM"
   fi
 fi
 
 # --- BUILD ------------------------------------------------------------------
-OPTIONS=("0 - use existing images" "1 - rebuild images")
-pick_option "BUILD? (default: 0)"
-BUILD="${PICK_RESULT:0:1}"
+if [[ -n "$ARG_BUILD" ]]; then
+  BUILD="$ARG_BUILD"
+elif [[ "$ASSUME_YES" == "1" ]]; then
+  BUILD="0"
+else
+  OPTIONS=("0 - use existing images" "1 - rebuild images")
+  pick_option "BUILD? (default: 0)"
+  BUILD="${PICK_RESULT:0:1}"
+fi
 
 # --- AMPLIFY ----------------------------------------------------------------
 # Off by default, same as `task stack` itself: it keeps boots fast and avoids
 # building the amplify image unless asked for.
-OPTIONS=("0 - no Amplify" "1 - also run this stack's monorepo Amplify service")
-pick_option "AMPLIFY? (default: 0)"
-AMPLIFY="${PICK_RESULT:0:1}"
+if [[ -n "$ARG_AMPLIFY" ]]; then
+  AMPLIFY="$ARG_AMPLIFY"
+elif [[ "$ASSUME_YES" == "1" ]]; then
+  AMPLIFY="0"
+else
+  OPTIONS=("0 - no Amplify" "1 - also run this stack's monorepo Amplify service")
+  pick_option "AMPLIFY? (default: 0)"
+  AMPLIFY="${PICK_RESULT:0:1}"
+fi
 
 # --- confirm & run ----------------------------------------------------------
 # RESEED, BUILD and AMPLIFY are NON-EMPTY tests downstream, not == 1:
@@ -197,7 +269,7 @@ echo
 if [[ "$RESEED" == "1" ]]; then
   echo "RESEED=1 destroys $STACK_DB_DIR and $REPO_ROOT/infrastructure/data-stack-$N."
   confirm=""
-  read -rp "Proceed? [y/N]: " confirm
+  [[ "$ASSUME_YES" == "1" ]] && confirm="y" || read -rp "Proceed? [y/N]: " confirm
   if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
     echo "Aborted."
     exit 1

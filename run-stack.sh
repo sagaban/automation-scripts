@@ -283,7 +283,7 @@ fi
 # doesn't leave the stack stopped.
 "$SCRIPT_DIR/ensure-aws-session.sh"
 
-rename_tab "stack-$N"
+rename_tab "Stack $N"
 
 # Tear down whatever is already running on this stack's project so the new run
 # starts from clean containers/network. Data dirs are kept, and the compose

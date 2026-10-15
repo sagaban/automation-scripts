@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Remove worktrees under WT_BASE whose branch carried real work that has landed on main.
-# Branches with no commits of their own are only warned about, never removed.
+# Remove what has landed on main: worktrees under WT_BASE whose branch carried real work,
+# then local branches with no worktree that were merged the same way. Branches with no
+# commits of their own are only warned about, never removed.
 #
 # Each registered worktree under WT_BASE lands in one of four buckets:
 #
@@ -24,6 +25,10 @@
 # (branch hotfix/CPE-1/foo can live in a directory named CPE-1-foo). When they differ
 # the task cannot delete the branch, so this script deletes it afterwards.
 #
+# Local branches checked out in no worktree go through the same four buckets and, when
+# merged, are deleted with `git branch -D` (squash merges are invisible to `git branch -d`).
+# Their tip SHA is printed, so `git branch <name> <sha>` brings one back.
+#
 # Finally, empty leftover directories under WT_BASE are pruned — the namespace dirs that
 # `rm -rf $WT_BASE/<dir>` leaves behind for slash-named branches (fix/, hotfix/,
 # story/CPE-1234/, dependabot/). Pruning STOPS at checkout boundaries: inside a worktree
@@ -32,16 +37,18 @@
 # would corrupt every data-stack database under WT_BASE.
 #
 # Usage:
-#   cleanup-merged-worktrees.sh [-n|--dry-run] [-y|--yes] [--force]
-#                               [--include-empty] [--keep-empty-dirs] [--no-fetch]
+#   prune-merged.sh [-n|--dry-run] [-y|--yes] [--force] [--include-empty]
+#                   [--keep-branches] [--keep-empty-dirs] [--no-fetch] [-v|--verbose]
 #
 #   -n, --dry-run          Classify everything, delete nothing.
 #   -y, --yes              Skip the confirmation prompt.
 #       --force            Also remove merged worktrees flagged as dirty / ahead of the
 #                          merged PR. Destructive: that uncommitted or unpushed work is lost.
 #       --include-empty    Also remove the warned "no commits beyond main" worktrees.
+#       --keep-branches    Only worktrees: leave branches without a worktree alone.
 #       --keep-empty-dirs  Skip the empty-directory prune.
 #       --no-fetch         Skip `git fetch --prune` (use cached remote state).
+#   -v, --verbose          List every kept (unmerged) branch, not just how many.
 #
 # Env overrides: REPO, WT_BASE, MAIN_BRANCH
 
@@ -56,7 +63,10 @@ ASSUME_YES=0
 FORCE=0
 INCLUDE_EMPTY=0
 PRUNE_DIRS=1
+PRUNE_BRANCHES=1
 DO_FETCH=1
+VERBOSE=0
+PR_LOOKUP_LIMIT=1000
 
 # Parallel arrays (bash 3.2 has no associative arrays). *_DIRS holds the WT_BASE-relative
 # worktree directory — the argument `task remove-worktree` actually needs.
@@ -64,6 +74,11 @@ MERGED_BRANCHES=(); MERGED_DIRS=(); MERGED_REASONS=()   # merged with real work
 EMPTY_BRANCHES=();  EMPTY_DIRS=();  EMPTY_REASONS=()    # no commits beyond main: warn
 BLOCKED_BRANCHES=(); BLOCKED_DIRS=(); BLOCKED_REASONS=() # merged but unsaved work
 KEEP_LINES=()        # unmerged, reported for context
+# Branches with no worktree, same buckets; *_TIPS keeps the SHA to restore one from.
+B_MERGED=(); B_MERGED_TIPS=(); B_MERGED_REASONS=()
+B_EMPTY=();  B_EMPTY_TIPS=();  B_EMPTY_REASONS=()
+B_BLOCKED=(); B_BLOCKED_TIPS=(); B_BLOCKED_REASONS=()
+B_KEEP=()
 ORPHAN_DIRS=()       # directories that are not registered worktrees
 
 while [[ $# -gt 0 ]]; do
@@ -72,9 +87,11 @@ while [[ $# -gt 0 ]]; do
     -y|--yes)          ASSUME_YES=1 ;;
     --force)           FORCE=1 ;;
     --include-empty)   INCLUDE_EMPTY=1 ;;
+    --keep-branches)   PRUNE_BRANCHES=0 ;;
     --keep-empty-dirs) PRUNE_DIRS=0 ;;
+    -v|--verbose)      VERBOSE=1 ;;
     --no-fetch)        DO_FETCH=0 ;;
-    -h|--help)         sed -n '2,46p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help)         sed -n '2,54p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "Unknown option: $1" >&2; exit 2 ;;
   esac
   shift
@@ -105,8 +122,16 @@ git rev-parse --verify --quiet "$REMOTE_MAIN" >/dev/null || REMOTE_MAIN="$MAIN_B
 # Main's own first-parent history, computed once. A commit on this list is part of
 # mainline itself; a merged feature tip is not (it enters as a merge's second parent).
 FP_LIST="$(mktemp -t merged-wt-fp)"
-trap 'rm -f "$FP_LIST"' EXIT
+PR_CACHE="$(mktemp -t merged-wt-prs)"
+trap 'rm -f "$FP_LIST" "$PR_CACHE"' EXIT
 git rev-list --first-parent "$REMOTE_MAIN" > "$FP_LIST"
+
+# Recent merged PRs as "<head branch> <number> <head oid>" lines, newest first: one call
+# covers most branches; one not found here (an older PR) is asked about on its own.
+if [[ $HAVE_GH -eq 1 ]]; then
+  gh pr list --state merged --limit "$PR_LOOKUP_LIMIT" --json number,headRefName,headRefOid \
+    --jq '.[] | "\(.headRefName) \(.number) \(.headRefOid)"' > "$PR_CACHE" 2>/dev/null || true
+fi
 
 # True when commit $1 is part of main's own first-parent history.
 on_mainline() {
@@ -120,6 +145,11 @@ find_merged_pr() {
   PR_NUM=""; PR_HEAD=""
   [[ $HAVE_GH -eq 1 ]] || return 0
   local out
+  out="$(awk -v b="$1" '$1 == b { print $2, $3; exit }' "$PR_CACHE")"
+  if [[ -n "$out" ]]; then
+    PR_NUM="${out%% *}"; PR_HEAD="${out##* }"
+    return 0
+  fi
   out="$(gh pr list --head "$1" --state merged --limit 1 \
         --json number,headRefOid --jq '.[0] | "\(.number) \(.headRefOid)"' 2>/dev/null || true)"
   [[ -z "$out" || "$out" == "null null" ]] && return 0
@@ -196,6 +226,45 @@ classify() {
   fi
 }
 
+# Classifies one local branch that no worktree has checked out. Args: <branch>
+# Same rules as classify(), minus the working-tree checks.
+classify_branch() {
+  local branch="$1" tip ahead reason
+  tip="$(git rev-parse "$branch")"
+  ahead="$(git rev-list --count "$REMOTE_MAIN..$branch")"
+
+  if [[ "$ahead" -eq 0 ]] && on_mainline "$tip"; then
+    B_EMPTY+=("$branch"); B_EMPTY_TIPS+=("$tip")
+    B_EMPTY_REASONS+=("no commits beyond $REMOTE_MAIN (tip ${tip:0:9} is mainline)")
+    return
+  fi
+
+  find_merged_pr "$branch"
+  if [[ -n "$PR_HEAD" ]]; then
+    reason="merged PR #$PR_NUM"
+  elif [[ "$ahead" -eq 0 ]]; then
+    reason="merged into $REMOTE_MAIN via merge commit"
+  else
+    B_KEEP+=("$branch — $ahead commit(s) not on $REMOTE_MAIN")
+    return
+  fi
+
+  if [[ -n "$PR_HEAD" && "$tip" != "$PR_HEAD" ]]; then
+    local extra=""
+    if git cat-file -e "$PR_HEAD^{commit}" 2>/dev/null; then
+      git merge-base --is-ancestor "$tip" "$PR_HEAD" 2>/dev/null \
+        || extra="$(git rev-list --count "$PR_HEAD..$branch") local commit(s) not in PR #$PR_NUM"
+    elif ! pr_contains_commit "$PR_NUM" "$tip"; then
+      extra="tip ${tip:0:9} is not a commit of PR #$PR_NUM (merged head not fetched)"
+    fi
+    if [[ -n "$extra" ]]; then
+      B_BLOCKED+=("$branch"); B_BLOCKED_TIPS+=("$tip"); B_BLOCKED_REASONS+=("$extra ($reason)")
+      return
+    fi
+  fi
+  B_MERGED+=("$branch"); B_MERGED_TIPS+=("$tip"); B_MERGED_REASONS+=("$reason")
+}
+
 # True when $1 sits inside a checkout, where an empty directory is real content rather
 # than leftover scaffolding. A container dir is recognised by holding an `app` child
 # (the worktree layout is <root>/app, <root>/etl) or a `.git` entry. `etl/` has neither
@@ -270,6 +339,15 @@ while IFS= read -r app_dir; do
   [[ $known -eq 0 ]] && ORPHAN_DIRS+=("$root")
 done < <(find "$WT_BASE" -mindepth 2 -maxdepth 5 -type d -name app -prune 2>/dev/null)
 
+# Local branches no worktree has checked out (anywhere, not just under WT_BASE).
+if [[ $PRUNE_BRANCHES -eq 1 ]]; then
+  echo "==> Inspecting branches without a worktree..."
+  while IFS='|' read -r branch wt; do
+    [[ -n "$wt" || "$branch" == "$MAIN_BRANCH" || "$branch" == "master" ]] && continue
+    classify_branch "$branch"
+  done < <(git for-each-ref --format='%(refname:short)|%(worktreepath)' refs/heads)
+fi
+
 # Renders one bucket. Args: <label> <count> then branches/dirs/reasons via name refs is
 # not available in bash 3.2, so each caller loops itself.
 echo ""
@@ -331,6 +409,50 @@ if [[ ${#MERGED_BRANCHES[@]} -gt 0 ]]; then
   echo ""
 fi
 
+if [[ ${#B_KEEP[@]} -gt 0 ]]; then
+  if [[ $VERBOSE -eq 1 ]]; then
+    echo "Keeping unmerged branches:"
+    printf '  - %s\n' "${B_KEEP[@]}"
+  else
+    echo "Keeping ${#B_KEEP[@]} unmerged branch(es) without a worktree (-v lists them)."
+  fi
+  echo ""
+fi
+
+if [[ ${#B_EMPTY[@]} -gt 0 ]]; then
+  echo "!! Branches with no commits beyond $REMOTE_MAIN, $([[ $INCLUDE_EMPTY -eq 1 ]] && echo 'deleting (--include-empty)' || echo 'NOT deleted'):"
+  printf '  - %s\n' "${B_EMPTY[@]}"
+  if [[ $INCLUDE_EMPTY -eq 1 ]]; then
+    B_MERGED+=("${B_EMPTY[@]}"); B_MERGED_TIPS+=("${B_EMPTY_TIPS[@]}"); B_MERGED_REASONS+=("${B_EMPTY_REASONS[@]}")
+  fi
+  echo ""
+fi
+
+if [[ ${#B_BLOCKED[@]} -gt 0 ]]; then
+  echo "Merged branches $([[ $FORCE -eq 1 ]] && echo 'FORCED' || echo 'skipped') (commits the PR doesn't have):"
+  i=0
+  while [[ $i -lt ${#B_BLOCKED[@]} ]]; do
+    echo "  - ${B_BLOCKED[$i]} — ${B_BLOCKED_REASONS[$i]}"
+    i=$((i + 1))
+  done
+  if [[ $FORCE -eq 1 ]]; then
+    B_MERGED+=("${B_BLOCKED[@]}"); B_MERGED_TIPS+=("${B_BLOCKED_TIPS[@]}"); B_MERGED_REASONS+=("${B_BLOCKED_REASONS[@]}")
+  else
+    echo "    (re-run with --force to delete these too)"
+  fi
+  echo ""
+fi
+
+if [[ ${#B_MERGED[@]} -gt 0 ]]; then
+  echo "Branches to delete (${#B_MERGED[@]}):"
+  i=0
+  while [[ $i -lt ${#B_MERGED[@]} ]]; do
+    echo "  - ${B_MERGED[$i]} — ${B_MERGED_REASONS[$i]}"
+    i=$((i + 1))
+  done
+  echo ""
+fi
+
 if [[ $DRY_RUN -eq 1 ]]; then
   if [[ $PRUNE_DIRS -eq 1 ]]; then
     EMPTY_DIRS_NOW="$(prunable_empty_dirs || true)"
@@ -345,7 +467,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
   exit 0
 fi
 
-if [[ ${#MERGED_BRANCHES[@]} -eq 0 ]]; then
+if [[ ${#MERGED_BRANCHES[@]} -eq 0 && ${#B_MERGED[@]} -eq 0 ]]; then
   if [[ $PRUNE_DIRS -eq 1 ]]; then
     echo "No worktrees to remove; pruning empty directories..."
     prune_empty_dirs
@@ -357,7 +479,7 @@ if [[ ${#MERGED_BRANCHES[@]} -eq 0 ]]; then
 fi
 
 if [[ $ASSUME_YES -eq 0 ]]; then
-  printf 'Remove these worktrees and delete their branches? [y/N] '
+  printf 'Remove these worktrees and delete these branches? [y/N] '
   read -r answer </dev/tty || answer=""
   case "$answer" in
     y|Y|yes|YES) ;;
@@ -388,6 +510,20 @@ while [[ $i -lt ${#MERGED_BRANCHES[@]} ]]; do
   fi
 done
 
+# Branch -D prints "(was <sha>)": with the list above, that's the way back.
+DELETED_BRANCHES=0
+if [[ ${#B_MERGED[@]} -gt 0 ]]; then
+  echo ""
+  echo "==> Deleting merged branches..."
+  for branch in "${B_MERGED[@]}"; do
+    if git branch -D "$branch" | sed 's/^/  /'; then
+      DELETED_BRANCHES=$((DELETED_BRANCHES + 1))
+    else
+      FAILED+=("$branch (branch)")
+    fi
+  done
+fi
+
 if [[ $PRUNE_DIRS -eq 1 ]]; then
   echo ""
   echo "==> Pruning empty directories under $WT_BASE..."
@@ -397,7 +533,7 @@ fi
 
 echo ""
 removed=$(( ${#MERGED_BRANCHES[@]} - ${#FAILED[@]} ))
-echo "Removed $removed of ${#MERGED_BRANCHES[@]} worktree(s), pruned $PRUNED_COUNT empty director$([[ $PRUNED_COUNT -eq 1 ]] && echo y || echo ies)."
+echo "Removed $removed of ${#MERGED_BRANCHES[@]} worktree(s), deleted $DELETED_BRANCHES of ${#B_MERGED[@]} branch(es), pruned $PRUNED_COUNT empty director$([[ $PRUNED_COUNT -eq 1 ]] && echo y || echo ies)."
 if [[ ${#FAILED[@]} -gt 0 ]]; then
   printf 'Failed: %s\n' "${FAILED[*]}" >&2
   exit 1

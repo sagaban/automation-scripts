@@ -1,1 +1,6 @@
 .env
+# Installed by batuta (scripts/install.sh) as links into its tools/
+run-stack.sh
+ensure-aws-session.sh
+prune-merged.sh
+prune-orphan-volumes.sh
